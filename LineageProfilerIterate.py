@@ -149,6 +149,7 @@ def importGeneModels(geneModels):
     geneModels=[]
     for line in open(fn,'rU').xreadlines():
         genes = cleanUpLine(line)
+        genes = string.replace(genes,"'",'')
         genes = string.replace(genes,' ',',')
         genes = string.split(genes,',')
         models=[]
@@ -164,10 +165,12 @@ def runLineageProfiler(species,array_type,exp_input,exp_output,codingtype,compen
     that are either supplied by the user or discovered from all possible combinations. """
     
     global exp_output_file; exp_output_file = exp_output; global targetPlatform
-    global tissue_specific_db; global expession_subset; global tissues; global sample_headers
+    global tissues; global sample_headers
     global analysis_type; global coding_type; coding_type = codingtype
     global tissue_to_gene; tissue_to_gene = {}; global platform; global cutoff
-    global customMarkerFile; global delim
+    global customMarkerFile; global delim; global keyed_by
+    #global tissue_specific_db
+    
     customMarkerFile = customMarkers
     if geneModels == False: geneModels = []
     else:
@@ -191,7 +194,7 @@ def runLineageProfiler(species,array_type,exp_input,exp_output,codingtype,compen
     else:
         value_type = 'expression'
     
-    tissue_specific_db={}; expession_subset=[]; sample_headers=[]; tissues=[]
+    tissue_specific_db={}; sample_headers=[]; tissues=[]
     if len(array_type)==2:
         ### When a user-supplied expression is provided (no ExpressionOutput files provided - importGeneIDTranslations)
         vendor, array_type = array_type
@@ -220,107 +223,70 @@ def runLineageProfiler(species,array_type,exp_input,exp_output,codingtype,compen
         translation_db=[]; keyed_by = 'primaryID'; targetPlatform = compendium_platform; analysis_type = 'geneLevel'
 
     targetPlatform = compendium_platform ### Overides above
-    try: importTissueSpecificProfiles(species)
+    try: importTissueSpecificProfiles(species,tissue_specific_db)
     except Exception:
         try:
             try:
                 targetPlatform = 'exon'
-                importTissueSpecificProfiles(species)
+                importTissueSpecificProfiles(species,tissue_specific_db)
             except Exception:
                 try:
                     targetPlatform = 'gene'
-                    importTissueSpecificProfiles(species)
+                    importTissueSpecificProfiles(species,tissue_specific_db)
                 except Exception: 
                     targetPlatform = "3'array"
-                    importTissueSpecificProfiles(species)
+                    importTissueSpecificProfiles(species,tissue_specific_db)
         except ZeroDivisionError:
             print 'No compatible compendiums present...'
             print e
             forceError
-                
+    
     all_marker_genes=[]            
     for gene in tissue_specific_db:
         all_marker_genes.append(gene)
-
+        
     if len(geneModels)>0:
         allPossibleClassifiers = geneModels
-    elif modelSize != None:
+    elif modelSize == None or modelSize == 'optimize':
+        allPossibleClassifiers = [all_marker_genes]
+    else:
         ### A specific model size has been specified (e.g., find all 10-gene models)
         allPossibleClassifiers = getRandomSets(all_marker_genes,modelSize)
-    else:
-        allPossibleClassifiers = [all_marker_genes]
-        
-
+                
     num=1
     if len(allPossibleClassifiers)<16:
         print 'Using:'
         for model in allPossibleClassifiers:
             print 'model',num,model
             num+=1
-
-    hit_list=[]
-    
+                
+    ### This is the main analysis function
     print 'Number of references to compare to:',len(tissues), tissues
-    ### Iterate through LineageProfiler for all gene models (allPossibleClassifiers)
-    times = 1; k=1000; l=1000; hits=[]; fails=[]; f=0; s=0; sample_diff_z={}; prognostic_class1_db={}; prognostic_class2_db={}
-    begin_time = time.time()
-    for classifiers in allPossibleClassifiers:
-        tissue_to_gene={}; expession_subset=[]; sample_headers=[]; classifier_specific_db={}
-        for gene in classifiers:
-            try: classifier_specific_db[gene] = tissue_specific_db[gene]
+    if modelSize != 'optimize':
+        hit_list, hits, fails, prognostic_class_db,sample_diff_z, evaluate_size = interateLineageProfiler(exp_input, tissue_specific_db, allPossibleClassifiers,translation_db,modelSize)
+    else:
+        summary_hit_list=[]
+        evaluate_size = len(allPossibleClassifiers[0])
+        hit_list, hits, fails, prognostic_class_db,sample_diff_z, evaluate_size = interateLineageProfiler(exp_input, tissue_specific_db, allPossibleClassifiers,translation_db,None)
+        while evaluate_size > 4:
+            hit_list.sort()
+            top_model = hit_list[-1][-1]
+            top_model_score = hit_list[-1][0]
+            """
+            try: ### Used for evaluation only - gives the same top models
+                second_model = hit_list[-2][-1]
+                second_model_score = hit_list[-2][0]
+                if second_model_score == top_model_score:
+                    top_model = second_model_score ### Try this
+                    print 'selecting secondary'
             except Exception: None
-        importGeneExpressionValues(exp_input,classifier_specific_db,keyed_by,translation_db)
-        ### If the incorrect gene system was indicated re-run with generic parameters
-        if len(expession_subset)==0 and (array_type == "3'array" or array_type == 'AltMouse'):
-            translation_db=[]; keyed_by = 'primaryID'; targetPlatform = compendium_platform; analysis_type = 'geneLevel'
-            importGeneExpressionValues(exp_input,tissue_specific_db,keyed_by,translation_db)
-        if len(expession_subset)!=len(classifiers): f+=1
-        if len(expession_subset)==len(classifiers): ### Sometimes a gene or two are missing from one set
-            s+=1
-            zscore_output_dir,tissue_scores = analyzeTissueSpecificExpressionPatterns()
-            #except Exception: print len(classifier_specific_db), classifiers; error
-            headers = list(tissue_scores['headers']); del tissue_scores['headers']
-            if times == k:
-                end_time = time.time()
-                print int(end_time-begin_time),'seconds'
-                k+=l
-            times+=1; index=0; positive=0; positive_score_diff=0
-            sample_number = (len(headers)-1)
-            population1_denom=0; population1_pos=0; population2_pos=0; population2_denom=0
-            diff_positive=[]; diff_negative=[]
-            while index < sample_number:
-                diff_z = tissue_scores[tissues[0]][index]-tissue_scores[tissues[-1]][index]
-                try: sample_diff_z[headers[index+1]].append(diff_z)
-                except Exception: sample_diff_z[headers[index+1]] =[diff_z]
-                if headers[index+1] not in prognostic_class1_db: prognostic_class1_db[headers[index+1]]=0 ### Create a default value for each sample
-                if headers[index+1] not in prognostic_class2_db: prognostic_class2_db[headers[index+1]]=0 ### Create a default value for each sample
-                if diff_z>0:
-                    prognostic_class1_db[headers[index+1]]+=1
-                if diff_z<0:
-                    prognostic_class2_db[headers[index+1]]+=1
-                if diff_z>0 and (tissues[0]+'-' in headers[index+1] or tissues[0]+':' in headers[index+1]):
-                    positive+=1; positive_score_diff+=abs(diff_z)
-                    population1_pos+=1; diff_positive.append(abs(diff_z))
-                    hits.append(headers[index+1]) ### see which are correctly classified
-                elif diff_z<0 and (tissues[-1]+'-' in headers[index+1] or tissues[-1]+':' in headers[index+1]):
-                    positive+=1; positive_score_diff+=abs(diff_z)
-                    population2_pos+=1; diff_positive.append(abs(diff_z))
-                    hits.append(headers[index+1]) ### see which are correctly classified
-                elif diff_z>0 and (tissues[-1]+'-' in headers[index+1] or tissues[-1]+':' in headers[index+1]): ### Incorrectly classified
-                    diff_negative.append(abs(diff_z))
-                    fails.append(headers[index+1])
-                elif diff_z<0 and (tissues[0]+'-' in headers[index+1] or tissues[0]+':' in headers[index+1]): ### Incorrectly classified
-                    #print headers[index+1]
-                    diff_negative.append(abs(diff_z))
-                    fails.append(headers[index+1])
-                if (tissues[0]+'-' in headers[index+1] or tissues[0]+':' in headers[index+1]):
-                    population1_denom+=1
-                else:
-                    population2_denom+=1
-                index+=1
-            percent_positive = (float(positive)/float(index))*100
-            hit_list.append([percent_positive,population1_pos, population1_denom,population2_pos,population2_denom,[avg(diff_positive),avg(diff_negative)],positive_score_diff,classifiers])
-
+            """
+            allPossibleClassifiers = [hit_list[-1][-1]]
+            
+            hit_list, hits, fails, prognostic_class_db,sample_diff_z, evaluate_size = interateLineageProfiler(exp_input, tissue_specific_db, allPossibleClassifiers,translation_db,modelSize)
+            summary_hit_list+=hit_list
+        hit_list = summary_hit_list
+        
     root_dir = string.join(string.split(exp_output_file,'/')[:-1],'/')+'/'
     dataset_name = string.replace(string.split(exp_input,'/')[-1][:-4],'exp.','')
     output_classification_file = root_dir+'SampleClassification/'+dataset_name+'-SampleClassification.txt'
@@ -331,15 +297,20 @@ def runLineageProfiler(species,array_type,exp_input,exp_output,codingtype,compen
     for i in allPossibleClassifiers:
         i = string.replace(str(i),"'",'')[1:-1]
         models.append(i)
-    headers = string.join(['Samples']+[tissues[0]+' Predicted Hits',tissues[1]+' Predicted Hits']+['Overall Prognostic Score','Median Z-score']+models,'\t')+'\n'
+    headers = string.join(['Samples']+tissues+['Overall Prognostic Score','Median Z-score Difference']+models,'\t')+'\n'
     export_summary.write(headers)
-    for sample in prognostic_class1_db:
-        class1_score = prognostic_class1_db[sample]
-        class2_score = prognostic_class2_db[sample]
+    for sample in prognostic_class_db:
+        class_db = prognostic_class_db[sample]
+        class_scores=[]; class_scores_str=[]
+        for tissue in tissues:
+            class_scores_str.append(str(class_db[tissue]))
+            class_scores.append(class_db[tissue])
         zscore_distribution = map(str,sample_diff_z[sample])
         dist_list = map(float,zscore_distribution) ### convert to list
         median_score = scipy.median(dist_list)
-        values = [sample,str(class1_score),str(class2_score),str(class1_score-class2_score),str(median_score)]
+        if len(tissues)==2:
+            class_scores_str = str(class1_score-class2_score) ### range of positive and negative scores for a two-class test
+        values = [sample]+class_scores_str+[str(max(class_scores)-min(class_scores)),str(median_score)]
         #print values
         #print zscore_distribution
         export_summary.write(string.join(values+zscore_distribution,'\t')+'\n')
@@ -376,7 +347,7 @@ def runLineageProfiler(species,array_type,exp_input,exp_output,codingtype,compen
                 #print i
                 None
 
-    if modelSize != None:
+    if modelSize != False:
         hits=[]
         for i in hits_db:
             hits.append([hits_db[i],i])
@@ -391,17 +362,119 @@ def runLineageProfiler(species,array_type,exp_input,exp_output,codingtype,compen
             except Exception:
                 #print i[1]
                 None
-        
+                
         for i in hit_list:
             if i[0]>0:
                 top_hit_list.append(i[-1])
-                top_hit_db[i[-1]]=i[0]
+                top_hit_db[tuple(i[-1])]=i[0]
                 
         print 'Top 20 top hits'
         for i in hit_list[:20]:
             print i[:5],i[-1]
 
     return top_hit_db
+
+def interateLineageProfiler(exp_input,tissue_specific_db,allPossibleClassifiers,translation_db,modelSize):
+    hit_list=[]
+    ### Iterate through LineageProfiler for all gene models (allPossibleClassifiers)
+    times = 1; k=1000; l=1000; hits=[]; fails=[]; f=0; s=0; sample_diff_z={}; prognostic_class1_db={}; prognostic_class2_db={}
+    prognostic_class_db={}
+    begin_time = time.time()
+    
+    evaluate_size=len(allPossibleClassifiers[0]) ### Number of reference markers to evaluate
+    
+    if modelSize=='optimize':
+        evaluate_size -= 1
+        allPossibleClassifiers = getRandomSets(allPossibleClassifiers[0],evaluate_size)
+    
+    for classifiers in allPossibleClassifiers:
+        tissue_to_gene={}; expession_subset=[]; sample_headers=[]; classifier_specific_db={}
+        for gene in classifiers:
+            try: classifier_specific_db[gene] = tissue_specific_db[gene]
+            except Exception: None
+        expession_subset = importGeneExpressionValues(exp_input,classifier_specific_db,translation_db,expession_subset)
+        ### If the incorrect gene system was indicated re-run with generic parameters
+        if len(expession_subset)==0:
+            translation_db=[]; keyed_by = 'primaryID'; targetPlatform = compendium_platform; analysis_type = 'geneLevel'
+            tissue_specific_db={}
+            importTissueSpecificProfiles(species,tissue_specific_db)
+            expession_subset = importGeneExpressionValues(exp_input,tissue_specific_db,translation_db,expession_subset)
+        if len(expession_subset)!=len(classifiers): f+=1
+        #if modelSize=='optimize': print len(expession_subset), len(classifiers);sys.exit()
+        if len(expession_subset)==len(classifiers): ### Sometimes a gene or two are missing from one set
+            s+=1
+            zscore_output_dir,tissue_scores = analyzeTissueSpecificExpressionPatterns(tissue_specific_db,expession_subset)
+            #except Exception: print len(classifier_specific_db), classifiers; error
+            headers = list(tissue_scores['headers']); del tissue_scores['headers']
+            if times == k:
+                end_time = time.time()
+                print int(end_time-begin_time),'seconds'
+                k+=l
+            times+=1; index=0; positive=0; positive_score_diff=0
+            sample_number = (len(headers)-1)
+            population1_denom=0; population1_pos=0; population2_pos=0; population2_denom=0
+            diff_positive=[]; diff_negative=[]
+            while index < sample_number:
+                scores = map(lambda x: tissue_scores[x][index], tissue_scores)
+                scores_copy = list(scores); scores_copy.sort()
+                diff_z = scores_copy[-1]-scores_copy[-2] ### Diff between the top two scores
+                j=0
+                for tissue in tissue_scores:
+                    if scores[j] == max(scores):
+                        hit_score = 1
+                    else: hit_score = 0
+                    if len(tissues)>2:
+                        if tissue+':' in headers[index+1] and hit_score==1:
+                            positive+=1
+                    try:
+                        class_db = prognostic_class_db[headers[index+1]]
+                        try: class_db[tissue]+=hit_score
+                        except Exception: class_db[tissue]=hit_score
+                    except Exception:
+                        class_db={}
+                        class_db[tissue]=hit_score
+                        prognostic_class_db[headers[index+1]] = class_db
+                    j+=1
+                #diff_z = tissue_scores[tissues[0]][index]-tissue_scores[tissues[-1]][index]
+                try: sample_diff_z[headers[index+1]].append(diff_z)
+                except Exception: sample_diff_z[headers[index+1]] =[diff_z]
+                
+                if len(tissues)==2:
+                    if headers[index+1] not in prognostic_class1_db:
+                        prognostic_class1_db[headers[index+1]]=0 ### Create a default value for each sample
+                    if headers[index+1] not in prognostic_class2_db:
+                        prognostic_class2_db[headers[index+1]]=0 ### Create a default value for each sample
+                    if diff_z>0:
+                        prognostic_class1_db[headers[index+1]]+=1
+                    if diff_z<0:
+                        prognostic_class2_db[headers[index+1]]+=1
+                    if diff_z>0 and (tissues[0]+'-' in headers[index+1] or tissues[0]+':' in headers[index+1]):
+                        positive+=1; positive_score_diff+=abs(diff_z)
+                        population1_pos+=1; diff_positive.append(abs(diff_z))
+                        hits.append(headers[index+1]) ### see which are correctly classified
+                    elif diff_z<0 and (tissues[-1]+'-' in headers[index+1] or tissues[-1]+':' in headers[index+1]):
+                        positive+=1; positive_score_diff+=abs(diff_z)
+                        population2_pos+=1; diff_positive.append(abs(diff_z))
+                        hits.append(headers[index+1]) ### see which are correctly classified
+                    elif diff_z>0 and (tissues[-1]+'-' in headers[index+1] or tissues[-1]+':' in headers[index+1]): ### Incorrectly classified
+                        diff_negative.append(abs(diff_z))
+                        fails.append(headers[index+1])
+                    elif diff_z<0 and (tissues[0]+'-' in headers[index+1] or tissues[0]+':' in headers[index+1]): ### Incorrectly classified
+                        #print headers[index+1]
+                        diff_negative.append(abs(diff_z))
+                        fails.append(headers[index+1])
+                    if (tissues[0]+'-' in headers[index+1] or tissues[0]+':' in headers[index+1]):
+                        population1_denom+=1
+                    else:
+                        population2_denom+=1
+                index+=1
+            percent_positive = (float(positive)/float(index))*100
+            if len(tissues)==2:
+                hit_list.append([percent_positive,population1_pos, population1_denom,population2_pos,population2_denom,[avg(diff_positive),avg(diff_negative)],positive_score_diff,classifiers])
+            else:
+                hit_list.append([percent_positive,len(classifiers),classifiers])
+    return hit_list, hits, fails, prognostic_class_db, sample_diff_z, evaluate_size
+
 
 def factorial(n):
     ### Code from http://docs.python.org/lib/module-doctest.html
@@ -437,7 +510,7 @@ def getRandomSets(a,size):
 
     import random
     possible_sets = choose(len(a),size)
-    print 'Possible',size,'gene combinations to test',possible_sets,
+    print 'Possible',size,'gene combinations to test',possible_sets
     permute_ls = []; done = 0; permute_db={}
     while done == 0:
         b = list(tuple(a)); random.shuffle(b)
@@ -493,7 +566,7 @@ def importVendorToEnsemblTranslations(species,vendor,exp_input):
     
     return translation_db
 
-def importTissueSpecificProfiles(species):
+def importTissueSpecificProfiles(species,tissue_specific_db):
     if analysis_type == 'AltExon':
         filename = 'AltDatabase/ensembl/'+species+'/'+species+'_'+targetPlatform +'_tissue-specific_AltExon_protein_coding.txt'
     else:
@@ -513,7 +586,7 @@ def importTissueSpecificProfiles(species):
             print 'Importing the tissue compedium database:',string.split(filename,delim)[-1][:-4]
             headers = t; x=1; index=0
             for i in headers:
-                if 'UID' == i: ens_index = index
+                if 'UID' == i: ens_index = index; uid_index = index
                 if analysis_type == 'AltExon': ens_index = ens_index ### Assigned above when analyzing probesets
                 elif 'Ensembl' in i: ens_index = index
                 if 'marker-in' in i: tissue_index = index+1; marker_in = index
@@ -522,12 +595,15 @@ def importTissueSpecificProfiles(species):
                 for i in t[tissue_index:]: tissues.append(i)
             except Exception:
                 for i in t[1:]: tissues.append(i)
+            if keyed_by == 'primaryID':
+                try: ens_index = uid_index
+                except Exception: None
         else:
             try:
                 gene = t[0]
                 tissue_exp = map(float, t[1:])
                 tissue_specific_db[gene]=x,tissue_exp ### Use this to only grab relevant gene expression profiles from the input dataset
-            except ZeroDivisionError:
+            except Exception:
                 gene = string.split(t[ens_index],'|')[0] ### Only consider the first listed gene - this gene is the best option based on ExpressionBuilder rankings
                 #if 'Pluripotent Stem Cells' in t[marker_in] or 'Heart' in t[marker_in]:
                 #if t[marker_in] not in tissues_added: ### Only add the first instance of a gene for that tissue - used more for testing to quickly run the analysis
@@ -544,7 +620,8 @@ def importTissueSpecificProfiles(species):
         except Exception:
             null=[]
             #print '\nNo tissue-specific correlations file present. Skipping analysis.'; kill
-        
+    return tissue_specific_db
+
 def importTissueCorrelations(filename):
     filename = string.replace(filename,'specific','specific_correlations')
     fn=filepath(filename); x=0
@@ -566,7 +643,7 @@ def simpleUIDImport(filename):
         uid_db[string.split(data,'\t')[0]]=[]
     return uid_db
         
-def importGeneExpressionValues(filename,tissue_specific_db,keyed_by,translation_db):
+def importGeneExpressionValues(filename,tissue_specific_db,translation_db,expession_subset):
     ### Import gene-level expression raw values           
     fn=filepath(filename); x=0; genes_added={}; gene_expression_db={}
     dataset_name = string.split(filename,delim)[-1][:-4]
@@ -607,7 +684,6 @@ def importGeneExpressionValues(filename,tissue_specific_db,keyed_by,translation_
                 if value_type == 'calls': ### Hence, this is a DABG or RNA-Seq expression
                     exp_vals = produceDetectionCalls(exp_vals,targetPlatform) ### 0 or 1 calls
                 gene_expression_db[gene] = [index,exp_vals]
-
     #print len(gene_expression_db), 'matching genes in the dataset and tissue compendium database'
     
     for gene in genes_added:
@@ -616,6 +692,7 @@ def importGeneExpressionValues(filename,tissue_specific_db,keyed_by,translation_
     #print len(expession_subset);sys.exit()
     expession_subset.sort() ### This order now matches that of 
     gene_expression_db=[]
+    return expession_subset
 
 def produceDetectionCalls(values,Platform):
     # Platform can be the compendium platform (targetPlatform) or analyzed data platform (platform or array_type)
@@ -687,7 +764,7 @@ def importExonIDTranslations(array_type,species,translate_to_genearray):
         del gene_translation_db; del gene_translation_db2
     return translation_db
 
-def analyzeTissueSpecificExpressionPatterns():
+def analyzeTissueSpecificExpressionPatterns(tissue_specific_db,expession_subset):
     tissue_specific_sorted = []; genes_present={}; tissue_exp_db={}; gene_order_db={}; gene_order=[]
     for (index,vals) in expession_subset: genes_present[index]=[]
     for gene in tissue_specific_db:
@@ -996,8 +1073,10 @@ if __name__ == '__main__':
             elif opt == '--s':
                 try: modelSize = int(arg)
                 except Exception:
-                    print 'Please specify a modelSize (e.g., 7-gene model search) as a single integer (e.g., 7)'
-                    sys.exit()
+                    modelSize = arg
+                    if modelSize != 'optimize':
+                        print 'Please specify a modelSize (e.g., 7-gene model search) as a single integer (e.g., 7)'
+                        sys.exit()
             else:
                 print "Warning! Command-line argument: %s not recognized. Exiting..." % opt; sys.exit()
             
